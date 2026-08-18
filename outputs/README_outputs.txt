@@ -1,0 +1,1 @@
+This folder is for graph images and summaries generated from the markdown files

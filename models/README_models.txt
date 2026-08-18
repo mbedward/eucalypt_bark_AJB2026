@@ -1,0 +1,1 @@
+This folder is to store fitted GAM objects saved as RDS files

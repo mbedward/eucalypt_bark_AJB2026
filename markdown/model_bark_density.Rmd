@@ -1,0 +1,1070 @@
+---
+title: "Model bark density"
+author: "Eli and Michael"
+date: "2026-06-15"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+
+library(bayesplot)
+library(dplyr, warn.conflicts = FALSE)
+library(glue)
+library(gratia)
+library(mgcv)
+library(sf)
+library(tidybayes)
+
+# Package with function to extract random effect estimates from a GAM.
+# This is not on CRAN but can be installed from github:
+# remotes::install_github('m-clark/mixedup')
+library(mixedup)
+
+library(ggplot2)
+theme_set( theme_bw() )
+
+library(ggrepel)
+
+
+DATA_DIR <- here("data")
+stopifnot(dir.exists(DATA_DIR))
+
+MODEL_DIR <- here("models")
+if (!dir.exists(MODEL_DIR)) dir.create(MODEL_DIR)
+
+OUTPUT_DIR <- here("outputs")
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR)
+
+GPKG <- file.path(DATA_DIR, "harriet_bark_dist.gpkg")
+stopifnot(file.exists(GPKG))
+
+
+# Function to use with dplyr::reframe() when drawing random effect estimates
+fn_qdf <- function(x) {
+  probs <- c(0.05, 0.25, 0.5, 0.75, 0.95)
+  prob_names = sprintf("q%02d", probs*100)
+  
+  res <- data.frame(
+    val = unname(quantile(x, probs = probs)),
+    q = prob_names
+  )
+}
+
+
+# Seed value to use with gratia for reproducible predictions between runs
+SEED <- 42
+
+# Flat to force refitting of all GAMs, even if cached models exist on disk
+FORCE_REFIT <- FALSE
+
+```
+
+
+## Summary
+
+Fit a generalized additive models to the bark density observations collected by Harriet and Eli. Separate models are fitted for each of the three broad bark types: smooth, stringy and rough.
+
+The structure of the models was decided a-priori, i.e. we are not doing model selection and are not concerned if one or more terms do not appear to be influential. The goal is inference via model predictions.
+
+Each model includes two random effect terms:
+  - site-level: to account for the clustering of trees within survey sites;
+  - species-level: to capture any systematic variation between species.
+
+
+## Data
+
+See `01_data.Rmd` for code used to prepare the data for the model.
+
+The data are stored as two non-spatial layers in the project geopackage. 
+
+Tree-level observations...
+
+```{r}
+
+DAT_trees_density <- st_read(GPKG, "trees_density", quiet = TRUE)
+
+str(DAT_trees_density)
+
+```
+
+Site-level predictors...
+
+```{r}
+
+DAT_predictors <- st_read(GPKG, "predictors_all", quiet = TRUE)
+
+```
+
+Sites...
+
+```{r}
+
+DAT_sites_density <- st_read(GPKG, "sites_density", quiet = TRUE)
+
+```
+
+
+Prepare a training data frame that includes all three broad bark types: smooth, stringy and rough.
+
+```{r}
+
+dat_all_barks_density <- DAT_trees_density %>%
+  filter(for_analysis,
+         !is.na(bark_density),
+         bark_type_h %in% c("Smooth", "Stringy", "Rough", "Stocking")) %>%
+  
+  # Drop records for indet taxa (e.g. Eucalyptus 'unknown mallee')
+  filter(!grepl(display_name, pattern = "unknown", ignore.case = TRUE)) %>%
+  
+  select(site_label, display_name, bark_type_h, bark_density, dbh) %>%
+
+  mutate(f_species = factor(display_name)) %>%
+  select(-display_name) %>%
+
+  left_join(DAT_predictors, by = join_by(site_label)) %>%
+
+  mutate(f_site = factor(site_label))
+
+# Check data structure
+str(dat_all_barks_density)
+
+```
+
+
+### Exploratory data summaries and graphs
+
+Examine the number of survey sites in each combination of bark type and fire frequency.
+
+```{r}
+
+dat_all_barks_density %>%
+  group_by(bark_type_h, fire_frequency) %>%
+  summarize(nsites = n_distinct(f_site), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = bark_type_h, values_from = nsites, values_fill = 0)
+
+```
+
+
+Similar to the data preparation for the bark thickness models, we lump the fire frequency values into two classes: less frequent (<=3 fires recorded) versus more frequency (>=4 fires recorded).
+
+```{r}
+
+dat_all_barks_density <- dat_all_barks_density %>%
+  mutate(f_firefreq = factor(ifelse(fire_frequency <= 3, "Less frequent fire", "More frequent fire")))
+
+```
+
+
+Summary table for the lumped fire frequency classes across bark types:
+
+```{r}
+
+dat_all_barks_density %>%
+  group_by(bark_type_h, f_firefreq) %>%
+  summarize(nsites = n_distinct(f_site), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = bark_type_h, values_from = nsites, values_fill = 0)
+
+```
+
+
+## Model smooth bark density
+
+```{r}
+
+dat_smooth_bark_density <- dat_all_barks_density %>%
+  filter(bark_type_h == "Smooth") %>%
+  mutate(dbh_log = log(dbh))
+
+```
+
+
+Graph distribution of bark density values to check for any suspicious values.
+
+```{r}
+
+ggplot(data = dat_smooth_bark_density, aes(x = bark_density)) +
+  geom_density() +
+  geom_rug()
+
+```
+
+
+There is a value very close to zero...
+
+```{r}
+
+i <- which.min(dat_smooth_bark_density$bark_density)
+
+dat_smooth_bark_density[i,]
+
+```
+
+Drop this value as potentially mistaken.
+
+```{r}
+
+dat_smooth_bark_density <- dat_smooth_bark_density[-i, ]
+
+glue("{nrow(dat_smooth_bark_density)} observations for {n_distinct(dat_smooth_bark_density$site_label)} sites")
+
+```
+
+
+### Fit model
+
+```{r}
+
+# Path for fitted model
+outpath <- file.path(MODEL_DIR, "gam_mgcv_smooth_bark_density.rds")
+
+if (!FORCE_REFIT && file.exists(outpath)) {
+  m_smooth_bark_density <- readRDS(outpath)
+  
+} else {
+  m_smooth_bark_density <- gam(
+    bark_density ~ f_firefreq + 
+      s(dbh_log) +
+      s(aridity) +
+      s(f_species, bs="re") +
+      s(f_site, bs="re"),
+    
+    data = dat_smooth_bark_density,
+    #family = Gamma(link = "log"),
+    family = tw(link = "log"),
+    method = "REML")
+
+  saveRDS(m_smooth_bark_density, outpath)
+}
+
+summary(m_smooth_bark_density)
+  
+```
+
+
+Posterior predictive check. Compare the distribution of bark density values from the model (observation-level predictions) with the distribution of the observed data.
+
+```{r}
+
+post <- gratia::posterior_samples(m_smooth_bark_density, n = 100, seed = SEED) %>%
+  tidyr::pivot_wider(names_from = .row, values_from = .response) %>%
+  select(-.draw) %>%
+  as.matrix()
+
+bayesplot::ppc_dens_overlay(y = dat_smooth_bark_density$bark_density,
+                            yrep = post)  
+
+```
+
+
+Graph the fitted smooth terms.
+
+```{r}
+
+gg <- gratia::draw(m_smooth_bark_density, select = c("s(dbh_log)", "s(aridity)"))
+
+outpath <- file.path(OUTPUT_DIR, "model_mgcv_smooth_bark_density_trends.png")
+
+ggsave(plot = gg, filename = outpath, width = 2400, height = 1800, units = "px")
+
+print(gg)
+
+```
+
+
+### Species random effect
+
+```{r}
+
+### Random effect estimates with 50% and 90% bounds
+x50 <- mixedup::extract_random_effects(m_smooth_bark_density, re = "f_species", ci_level = 0.5)
+x90 <- mixedup::extract_random_effects(m_smooth_bark_density, re = "f_species", ci_level = 0.9)
+
+# Extract estimates and format for ggplot, with species ordered by mean
+# random effect value
+dat_raneff <- x50 %>%
+  bind_cols(x90 %>% select(lower_5, upper_95)) %>%
+  rename(mean = value) %>%
+  arrange(mean) %>%
+  mutate(ordered_group = factor(group, levels = group, labels = group))
+
+
+gg <- ggplot(data = dat_raneff, aes(y = ordered_group)) +
+  # 90% intervals as thin lines
+  geom_linerange(aes(xmin = lower_5, xmax = upper_95),
+                 linewidth = 0.75, colour = "grey40") +
+
+  # Mean points and 50% intervals as thicker lines  
+  geom_pointrange(aes(xmin = lower_25, xmax = upper_75, x = mean),
+                  linewidth = 1.5, size = 0.75, colour = "grey40") +
+  
+  labs(x = "Random effect estimate", y = "") +
+  
+  theme_bw()
+
+
+outpath <- file.path(OUTPUT_DIR, "model_mgcv_smooth_bark_density_spp_raneff.png")
+
+ggsave(plot = gg, filename = outpath, width = 1800, height = 2400, units = "px")
+
+print(gg)
+
+```
+
+
+### Counter-factual predictions
+
+Derive prediction with DBH held at its median value and the species and site random effects excluded.
+
+```{r}
+
+d_ <- dat_smooth_bark_density
+
+dat_predict <- expand.grid(
+  dbh_log = log(median(d_$dbh)),
+  f_firefreq = factor(levels(d_$f_firefreq)),
+  f_species = d_$f_species[1],
+  f_site = d_$f_site[1],
+  
+  aridity = seq(min(d_$aridity), max(d_$aridity), length.out = 51)
+)
+
+# Trim the prediction data to the range of aridity seen within each fire frequency class
+dat_arid_lims <- dat_smooth_bark_density %>%
+  group_by(f_firefreq) %>%
+  summarize(lo = min(aridity) - 0.02, hi = max(aridity) + 0.02)  # wiggle room
+
+dat_predict <- dat_predict %>%
+  left_join(dat_arid_lims, by = join_by(f_firefreq)) %>%
+  filter(aridity >= lo & aridity <= hi)
+
+NDRAWS <- 4000
+
+# Draw observation-level predictions from the posterior distribution and summarize
+# as 90% posterior prediction interval
+dat_postpred <- gratia::add_posterior_samples(dat_predict, 
+                                              model = m_smooth_bark_density, 
+                                              n = NDRAWS, 
+                                              exclude = c("s(f_site)", "s(f_species)"),
+                                              unconditional = TRUE,
+                                              seed = SEED) %>%
+  
+  group_by(.row, aridity, f_firefreq) %>%
+  
+  tidybayes::median_qi(.response, .width = 0.9)
+
+
+# Draw mean predictions from the posterior distribution and calculate 50% and 90% bounds
+# (highest density intervals)
+dat_epred <- gratia::add_fitted_samples(dat_predict,
+                                        model = m_smooth_bark_density,
+                                        n = NDRAWS,
+                                        seed = 99,
+                                        scale = "response",
+                                        exclude = c("s(f_site)", "s(f_species)"),
+                                        unconditional = TRUE) %>%
+  group_by(.row, aridity, f_firefreq)
+
+dat_epred_mid <- dat_epred %>%
+  summarize(mid = median(.fitted), .groups = "drop")
+
+dat_hdi50 <- dat_epred %>%
+  tidybayes::mean_hdi(.fitted, .width = 0.5) %>%
+  select(.row, lwr50 = .lower, upr50 = .upper)
+
+dat_hdi90 <- dat_epred %>%
+  tidybayes::mean_hdi(.fitted, .width = 0.9) %>%
+  select(.row, lwr90 = .lower, upr90 = .upper)
+
+dat_gg <- dat_epred_mid %>%
+  left_join(dat_hdi50, by = join_by(.row)) %>%
+  left_join(dat_hdi90, by = join_by(.row))
+  
+
+gg <- ggplot(data = dat_gg, aes(x = aridity)) +
+  # 50% bounds on predicted mean
+  geom_ribbon(aes(ymin = lwr50, ymax = upr50), alpha = 0.2) +
+  
+  # 90% bounds on predicted mean
+  geom_ribbon(aes(ymin = lwr90, ymax = upr90), colour = "grey", alpha = 0.2) +
+  
+  # Mean trend
+  geom_line(aes(y = mid), colour = "black", linewidth = 1, linetype = "solid", alpha = 0.8) +
+  
+  # 90% prediction interval (i.e. individual tree level)
+  geom_ribbon(data = dat_postpred, aes(ymin = .lower, ymax = .upper),
+              fill = NA, colour = "black", linetype = "longdash") +
+  
+  # Observed data
+  geom_point(data = d_, aes(y = bark_density, colour = f_species), alpha = 0.7) +
+  
+  labs(x = "Landscape aridity", y = "Bark density", colour = "Species") +
+  
+  facet_wrap(~f_firefreq) +
+  
+  scale_colour_viridis_d(option = "viridis") +
+  
+  theme(
+    legend.text     = element_text(face = "italic", size = 8),
+    legend.key.size = unit(0.3, "cm")
+  )
+
+
+outpath <- file.path(OUTPUT_DIR, "model_mgcv_smooth_bark_density_cfpredict.png")
+
+ggsave(plot = gg, filename = outpath, width = 2400, height = 1800, units = "px")
+
+print(gg)
+
+```
+
+
+Alternative graph only colour observations for those species that occur near extremes of aridity.
+
+```{r}
+
+d_ <- dat_smooth_bark_density
+
+aridity_quantiles <- quantile(d_$aridity, c(0.1, 0.9))
+
+# Identify species with occurrences at either aridity extreme
+dat_focal_species <- d_ %>%
+  group_by(f_species) %>%
+  
+  summarize(
+    at_dry = any(aridity <= aridity_quantiles[1]),
+    at_wet = any(aridity >= aridity_quantiles[2])
+  ) %>%
+  
+  filter(at_dry | at_wet) %>%
+  
+  pull(f_species)
+
+
+gg_focalspp <- ggplot(data = dat_gg, aes(x = aridity)) +
+  # 50% bounds on predicted mean
+  geom_ribbon(aes(ymin = lwr50, ymax = upr50), alpha = 0.2) +
+  
+  # 90% bounds on predicted mean
+  geom_ribbon(aes(ymin = lwr90, ymax = upr90), colour = "grey", alpha = 0.2) +
+  
+  # Mean trend
+  geom_line(aes(y = mid), colour = "black", linewidth = 1, linetype = "solid", alpha = 0.8) +
+  
+  # 90% prediction interval (i.e. individual tree level)
+  geom_ribbon(data = dat_postpred, aes(ymin = .lower, ymax = .upper),
+              fill = NA, colour = "black", linetype = "longdash") +
+  
+  # Observed data
+  geom_point(data = d_, aes(y = bark_density), colour = "grey", alpha = 0.7) +
+
+  # Focal species observations coloured
+  geom_point(data = d_ %>% filter(f_species %in% dat_focal_species),
+             aes(y = bark_density, colour = f_species), alpha = 0.7) +
+  
+  labs(x = "Landscape aridity", y = "Bark density", colour = "Species") +
+  
+  facet_wrap(~f_firefreq) +
+  
+  scale_colour_viridis_d(option = "viridis") +
+  
+  theme(
+    legend.text     = element_text(face = "italic", size = 8),
+    legend.key.size = unit(0.3, "cm")
+  )
+
+
+outpath <- file.path(OUTPUT_DIR, "model_mgcv_smooth_bark_density_cfpredict_focalspp.png")
+ggsave(plot = gg_focalspp, filename = outpath, width = 2400, height = 1800, units = "px")
+
+print(gg_focalspp)
+
+```
+
+
+## Model stringy bark density
+
+The model structure is based on that for bark thickness.
+
+```{r}
+
+dat_stringy_bark_density <- dat_all_barks_density %>%
+  filter(bark_type_h == "Stringy") %>%
+  mutate(dbh_log = log(dbh))
+
+glue("{nrow(dat_stringy_bark_density)} observations for {n_distinct(dat_stringy_bark_density$site_label)} sites")
+
+```
+
+
+Graph distribution of bark density values to check for any suspicious values.
+
+```{r}
+
+ggplot(data = dat_stringy_bark_density, aes(x = bark_density)) +
+  geom_density() +
+  geom_rug()
+
+```
+
+
+### Fit model
+
+```{r}
+
+# Path for fitted model
+outpath <- file.path(MODEL_DIR, "gam_mgcv_stringy_bark_density.rds")
+
+if (!FORCE_REFIT && file.exists(outpath)) {
+  m_stringy_bark_density <- readRDS(outpath)
+  
+} else {
+  m_stringy_bark_density <- gam(
+    bark_density ~ f_firefreq + 
+      s(dbh_log) +
+      s(aridity) +
+      s(f_species, bs="re") +
+      s(f_site, bs="re"),
+    
+    data = dat_stringy_bark_density,
+    #family = Gamma(link = "log"),
+    family = tw(link = "log"),
+    method = "REML")
+
+  saveRDS(m_stringy_bark_density, outpath)
+}
+
+summary(m_stringy_bark_density)
+  
+```
+
+
+Posterior predictive check. Compare the distribution of bark density values from the model (observation-level predictions) with the distribution of the observed data.
+
+```{r}
+
+post <- gratia::posterior_samples(m_stringy_bark_density, n = 100, seed = SEED) %>%
+  tidyr::pivot_wider(names_from = .row, values_from = .response) %>%
+  select(-.draw) %>%
+  as.matrix()
+
+bayesplot::ppc_dens_overlay(y = dat_stringy_bark_density$bark_density,
+                            yrep = post)  
+
+```
+
+
+Graph the fitted smooth terms.
+
+```{r}
+
+gg <- gratia::draw(m_stringy_bark_density, select = c("s(dbh_log)", "s(aridity)"))
+
+outpath <- file.path(OUTPUT_DIR, "model_mgcv_stringy_bark_density_trends.png")
+
+ggsave(plot = gg, filename = outpath, width = 2400, height = 1800, units = "px")
+
+print(gg)
+
+```
+
+
+### Species random effect
+
+```{r}
+
+### Random effect estimates with 50% and 90% bounds
+x50 <- mixedup::extract_random_effects(m_stringy_bark_density, re = "f_species", ci_level = 0.5)
+x90 <- mixedup::extract_random_effects(m_stringy_bark_density, re = "f_species", ci_level = 0.9)
+
+# Extract estimates and format for ggplot, with species ordered by mean
+# random effect value
+dat_raneff <- x50 %>%
+  bind_cols(x90 %>% select(lower_5, upper_95)) %>%
+  rename(mean = value) %>%
+  arrange(mean) %>%
+  mutate(ordered_group = factor(group, levels = group, labels = group))
+
+
+gg <- ggplot(data = dat_raneff, aes(y = ordered_group)) +
+  # 90% intervals as thin lines
+  geom_linerange(aes(xmin = lower_5, xmax = upper_95),
+                 linewidth = 0.75, colour = "grey40") +
+
+  # Mean points and 50% intervals as thicker lines  
+  geom_pointrange(aes(xmin = lower_25, xmax = upper_75, x = mean),
+                  linewidth = 1.5, size = 0.75, colour = "grey40") +
+  
+  labs(x = "Random effect estimate", y = "") +
+  
+  theme_bw()
+
+
+outpath <- file.path(OUTPUT_DIR, "model_mgcv_stringy_bark_density_spp_raneff.png")
+
+ggsave(plot = gg, filename = outpath, width = 1800, height = 2400, units = "px")
+
+print(gg)
+
+```
+
+
+### Counter-factual predictions
+
+Derive prediction with DBH held at its median value and the species and site random effects excluded.
+
+```{r}
+
+d_ <- dat_stringy_bark_density
+
+dat_predict <- expand.grid(
+  dbh_log = log(median(d_$dbh)),
+  f_firefreq = factor(levels(d_$f_firefreq)),
+  f_species = d_$f_species[1],
+  f_site = d_$f_site[1],
+  
+  aridity = seq(min(d_$aridity), max(d_$aridity), length.out = 51)
+)
+
+# Trim the prediction data to the range of aridity seen within each fire frequency class
+dat_arid_lims <- d_ %>%
+  group_by(f_firefreq) %>%
+  summarize(lo = min(aridity) - 0.02, hi = max(aridity) + 0.02)  # wiggle room
+
+dat_predict <- dat_predict %>%
+  left_join(dat_arid_lims, by = join_by(f_firefreq)) %>%
+  filter(aridity >= lo & aridity <= hi)
+
+NDRAWS <- 4000
+
+# Draw observation-level predictions from the posterior distribution and summarize
+# as 90% posterior prediction interval
+dat_postpred <- gratia::add_posterior_samples(dat_predict, 
+                                              model = m_stringy_bark_density, 
+                                              n = NDRAWS, 
+                                              exclude = c("s(f_site)", "s(f_species)"),
+                                              unconditional = TRUE,
+                                              seed = SEED) %>%
+  
+  group_by(.row, aridity, f_firefreq) %>%
+  
+  tidybayes::median_qi(.response, .width = 0.9)
+
+
+# Draw mean predictions from the posterior distribution and calculate 50% and 90% bounds
+# (highest density intervals)
+dat_epred <- gratia::add_fitted_samples(dat_predict,
+                                        model = m_stringy_bark_density,
+                                        n = NDRAWS,
+                                        seed = 99,
+                                        scale = "response",
+                                        exclude = c("s(f_site)", "s(f_species)"),
+                                        unconditional = TRUE) %>%
+  group_by(.row, aridity, f_firefreq)
+
+dat_epred_mid <- dat_epred %>%
+  summarize(mid = median(.fitted), .groups = "drop")
+
+dat_hdi50 <- dat_epred %>%
+  tidybayes::mean_hdi(.fitted, .width = 0.5) %>%
+  select(.row, lwr50 = .lower, upr50 = .upper)
+
+dat_hdi90 <- dat_epred %>%
+  tidybayes::mean_hdi(.fitted, .width = 0.9) %>%
+  select(.row, lwr90 = .lower, upr90 = .upper)
+
+dat_gg <- dat_epred_mid %>%
+  left_join(dat_hdi50, by = join_by(.row)) %>%
+  left_join(dat_hdi90, by = join_by(.row))
+  
+
+gg <- ggplot(data = dat_gg, aes(x = aridity)) +
+  # 50% bounds on predicted mean
+  geom_ribbon(aes(ymin = lwr50, ymax = upr50), alpha = 0.2) +
+  
+  # 90% bounds on predicted mean
+  geom_ribbon(aes(ymin = lwr90, ymax = upr90), colour = "grey", alpha = 0.2) +
+  
+  # Mean trend
+  geom_line(aes(y = mid), colour = "black", linewidth = 1, linetype = "solid", alpha = 0.8) +
+  
+  # 90% prediction interval (i.e. individual tree level)
+  geom_ribbon(data = dat_postpred, aes(ymin = .lower, ymax = .upper),
+              fill = NA, colour = "black", linetype = "longdash") +
+  
+  # Observed data
+  geom_point(data = d_, aes(y = bark_density, colour = f_species), alpha = 0.7) +
+  
+  labs(x = "Landscape aridity", y = "Bark density", colour = "Species") +
+  
+  facet_wrap(~f_firefreq) +
+  
+  scale_colour_viridis_d(option = "viridis") +
+  
+  theme(
+    legend.text     = element_text(face = "italic", size = 8),
+    legend.key.size = unit(0.3, "cm")
+  )
+
+
+outpath <- file.path(OUTPUT_DIR, "model_mgcv_stringy_bark_density_cfpredict.png")
+
+ggsave(plot = gg, filename = outpath, width = 2400, height = 1800, units = "px")
+
+print(gg)
+
+```
+
+
+Alternative graph only colour observations for those species that occur near extremes of aridity.
+
+```{r}
+
+d_ <- dat_stringy_bark_density
+
+aridity_quantiles <- quantile(d_$aridity, c(0.1, 0.9))
+
+# Identify species with occurrences at either aridity extreme
+dat_focal_species <- d_ %>%
+  group_by(f_species) %>%
+  
+  summarize(
+    at_dry = any(aridity <= aridity_quantiles[1]),
+    at_wet = any(aridity >= aridity_quantiles[2])
+  ) %>%
+  
+  filter(at_dry | at_wet) %>%
+  
+  pull(f_species)
+
+
+gg_focalspp <- ggplot(data = dat_gg, aes(x = aridity)) +
+  # 50% bounds on predicted mean
+  geom_ribbon(aes(ymin = lwr50, ymax = upr50), alpha = 0.2) +
+  
+  # 90% bounds on predicted mean
+  geom_ribbon(aes(ymin = lwr90, ymax = upr90), colour = "grey", alpha = 0.2) +
+  
+  # Mean trend
+  geom_line(aes(y = mid), colour = "black", linewidth = 1, linetype = "solid", alpha = 0.8) +
+  
+  # 90% prediction interval (i.e. individual tree level)
+  geom_ribbon(data = dat_postpred, aes(ymin = .lower, ymax = .upper),
+              fill = NA, colour = "black", linetype = "longdash") +
+  
+  # Observed data
+  geom_point(data = d_, aes(y = bark_density), colour = "grey", alpha = 0.7) +
+
+  # Focal species observations coloured
+  geom_point(data = d_ %>% filter(f_species %in% dat_focal_species),
+             aes(y = bark_density, colour = f_species), alpha = 0.7) +
+  
+  labs(x = "Landscape aridity", y = "Bark density", colour = "Species") +
+  
+  facet_wrap(~f_firefreq) +
+  
+  scale_colour_viridis_d(option = "viridis") +
+  
+  theme(
+    legend.text     = element_text(face = "italic", size = 8),
+    legend.key.size = unit(0.3, "cm")
+  )
+
+
+outpath <- file.path(OUTPUT_DIR, "model_mgcv_stringy_bark_density_cfpredict_focalspp.png")
+ggsave(plot = gg_focalspp, filename = outpath, width = 2400, height = 1800, units = "px")
+
+print(gg_focalspp)
+
+```
+
+
+
+## Model rough bark density
+
+```{r}
+
+dat_rough_bark_density <- dat_all_barks_density %>%
+  filter(bark_type_h == "Rough") %>%
+  mutate(dbh_log = log(dbh))
+
+glue("{nrow(dat_rough_bark_density)} observations for {n_distinct(dat_rough_bark_density$site_label)} sites")
+
+```
+
+
+### Fit model
+
+```{r}
+
+# Path for fitted model
+outpath <- file.path(MODEL_DIR, "gam_mgcv_rough_bark_density.rds")
+
+if (!FORCE_REFIT && file.exists(outpath)) {
+  m_rough_bark_density <- readRDS(outpath)
+  
+} else {
+  m_rough_bark_density <- gam(
+    bark_density ~ f_firefreq + 
+      s(dbh_log) +
+      s(aridity) +
+      s(f_species, bs="re") +
+      s(f_site, bs="re"),
+    
+    data = dat_rough_bark_density,
+    #family = Gamma(link = "log"),
+    family = tw(link = "log"),
+    method = "REML")
+
+  saveRDS(m_rough_bark_density, outpath)
+}
+
+summary(m_rough_bark_density)
+  
+```
+
+
+Posterior predictive check. Compare the distribution of bark density values from the model (observation-level predictions) with the distribution of the observed data.
+
+```{r}
+
+post <- gratia::posterior_samples(m_rough_bark_density, n = 100, seed = SEED) %>%
+  tidyr::pivot_wider(names_from = .row, values_from = .response) %>%
+  select(-.draw) %>%
+  as.matrix()
+
+bayesplot::ppc_dens_overlay(y = dat_rough_bark_density$bark_density,
+                            yrep = post)  
+
+```
+
+
+Graph the fitted smooth terms.
+
+```{r}
+
+gg <- gratia::draw(m_rough_bark_density, select = c("s(dbh_log)", "s(aridity)"))
+
+outpath <- file.path(OUTPUT_DIR, "model_mgcv_rough_bark_density_trends.png")
+
+ggsave(plot = gg, filename = outpath, width = 2400, height = 1800, units = "px")
+
+print(gg)
+
+```
+
+
+### Species random effect
+
+```{r}
+
+### Random effect estimates with 50% and 90% bounds
+x50 <- mixedup::extract_random_effects(m_rough_bark_density, re = "f_species", ci_level = 0.5)
+x90 <- mixedup::extract_random_effects(m_rough_bark_density, re = "f_species", ci_level = 0.9)
+
+# Extract estimates and format for ggplot, with species ordered by mean
+# random effect value
+dat_raneff <- x50 %>%
+  bind_cols(x90 %>% select(lower_5, upper_95)) %>%
+  rename(mean = value) %>%
+  arrange(mean) %>%
+  mutate(ordered_group = factor(group, levels = group, labels = group))
+
+
+gg <- ggplot(data = dat_raneff, aes(y = ordered_group)) +
+  # 90% intervals as thin lines
+  geom_linerange(aes(xmin = lower_5, xmax = upper_95),
+                 linewidth = 0.75, colour = "grey40") +
+
+  # Mean points and 50% intervals as thicker lines  
+  geom_pointrange(aes(xmin = lower_25, xmax = upper_75, x = mean),
+                  linewidth = 1.5, size = 0.75, colour = "grey40") +
+  
+  labs(x = "Random effect estimate", y = "") +
+  
+  theme_bw()
+
+
+outpath <- file.path(OUTPUT_DIR, "model_mgcv_rough_bark_density_spp_raneff.png")
+
+ggsave(plot = gg, filename = outpath, width = 1800, height = 2400, units = "px")
+
+print(gg)
+
+```
+
+
+### Counter-factual predictions
+
+Derive prediction with DBH held at its median value and the species and site random effects excluded.
+
+```{r}
+
+d_ <- dat_rough_bark_density
+
+dat_predict <- expand.grid(
+  dbh_log = log(median(d_$dbh)),
+  f_firefreq = factor(levels(d_$f_firefreq)),
+  f_species = d_$f_species[1],
+  f_site = d_$f_site[1],
+  
+  aridity = seq(min(d_$aridity), max(d_$aridity), length.out = 51)
+)
+
+# Trim the prediction data to the range of aridity seen within each fire frequency class
+dat_arid_lims <- d_ %>%
+  group_by(f_firefreq) %>%
+  summarize(lo = min(aridity) - 0.02, hi = max(aridity) + 0.02)  # wiggle room
+
+dat_predict <- dat_predict %>%
+  left_join(dat_arid_lims, by = join_by(f_firefreq)) %>%
+  filter(aridity >= lo & aridity <= hi)
+
+NDRAWS <- 4000
+
+# Draw observation-level predictions from the posterior distribution and summarize
+# as 90% posterior prediction interval
+dat_postpred <- gratia::add_posterior_samples(dat_predict, 
+                                              model = m_rough_bark_density, 
+                                              n = NDRAWS, 
+                                              exclude = c("s(f_site)", "s(f_species)"),
+                                              unconditional = TRUE,
+                                              seed = SEED) %>%
+  
+  group_by(.row, aridity, f_firefreq) %>%
+  
+  tidybayes::median_qi(.response, .width = 0.9)
+
+
+# Draw mean predictions from the posterior distribution and calculate 50% and 90% bounds
+# (highest density intervals)
+dat_epred <- gratia::add_fitted_samples(dat_predict,
+                                        model = m_rough_bark_density,
+                                        n = NDRAWS,
+                                        seed = 99,
+                                        scale = "response",
+                                        exclude = c("s(f_site)", "s(f_species)"),
+                                        unconditional = TRUE) %>%
+  group_by(.row, aridity, f_firefreq)
+
+dat_epred_mid <- dat_epred %>%
+  summarize(mid = median(.fitted), .groups = "drop")
+
+dat_hdi50 <- dat_epred %>%
+  tidybayes::mean_hdi(.fitted, .width = 0.5) %>%
+  select(.row, lwr50 = .lower, upr50 = .upper)
+
+dat_hdi90 <- dat_epred %>%
+  tidybayes::mean_hdi(.fitted, .width = 0.9) %>%
+  select(.row, lwr90 = .lower, upr90 = .upper)
+
+dat_gg <- dat_epred_mid %>%
+  left_join(dat_hdi50, by = join_by(.row)) %>%
+  left_join(dat_hdi90, by = join_by(.row))
+  
+
+gg <- ggplot(data = dat_gg, aes(x = aridity)) +
+  # 50% bounds on predicted mean
+  geom_ribbon(aes(ymin = lwr50, ymax = upr50), alpha = 0.2) +
+  
+  # 90% bounds on predicted mean
+  geom_ribbon(aes(ymin = lwr90, ymax = upr90), colour = "grey", alpha = 0.2) +
+  
+  # Mean trend
+  geom_line(aes(y = mid), colour = "black", linewidth = 1, linetype = "solid", alpha = 0.8) +
+  
+  # 90% prediction interval (i.e. individual tree level)
+  geom_ribbon(data = dat_postpred, aes(ymin = .lower, ymax = .upper),
+              fill = NA, colour = "black", linetype = "longdash") +
+  
+  # Observed data
+  geom_point(data = d_, aes(y = bark_density, colour = f_species), alpha = 0.7) +
+  
+  labs(x = "Landscape aridity", y = "Bark density", colour = "Species") +
+  
+  facet_wrap(~f_firefreq) +
+  
+  scale_colour_viridis_d(option = "viridis") +
+  
+  theme(
+    legend.text     = element_text(face = "italic", size = 8),
+    legend.key.size = unit(0.3, "cm")
+  )
+
+
+outpath <- file.path(OUTPUT_DIR, "model_mgcv_rough_bark_density_cfpredict.png")
+
+ggsave(plot = gg, filename = outpath, width = 2400, height = 1800, units = "px")
+
+print(gg)
+
+```
+
+
+Alternative graph only colour observations for those species that occur near extremes of aridity.
+
+```{r}
+
+d_ <- dat_rough_bark_density
+
+aridity_quantiles <- quantile(d_$aridity, c(0.1, 0.9))
+
+# Identify species with occurrences at either aridity extreme
+dat_focal_species <- d_ %>%
+  group_by(f_species) %>%
+  
+  summarize(
+    at_dry = any(aridity <= aridity_quantiles[1]),
+    at_wet = any(aridity >= aridity_quantiles[2])
+  ) %>%
+  
+  filter(at_dry | at_wet) %>%
+  
+  pull(f_species)
+
+
+gg_focalspp <- ggplot(data = dat_gg, aes(x = aridity)) +
+  # 50% bounds on predicted mean
+  geom_ribbon(aes(ymin = lwr50, ymax = upr50), alpha = 0.2) +
+  
+  # 90% bounds on predicted mean
+  geom_ribbon(aes(ymin = lwr90, ymax = upr90), colour = "grey", alpha = 0.2) +
+  
+  # Mean trend
+  geom_line(aes(y = mid), colour = "black", linewidth = 1, linetype = "solid", alpha = 0.8) +
+  
+  # 90% prediction interval (i.e. individual tree level)
+  geom_ribbon(data = dat_postpred, aes(ymin = .lower, ymax = .upper),
+              fill = NA, colour = "black", linetype = "longdash") +
+  
+  # Observed data
+  geom_point(data = d_, aes(y = bark_density), colour = "grey", alpha = 0.7) +
+
+  # Focal species observations coloured
+  geom_point(data = d_ %>% filter(f_species %in% dat_focal_species),
+             aes(y = bark_density, colour = f_species), alpha = 0.7) +
+  
+  labs(x = "Landscape aridity", y = "Bark density", colour = "Species") +
+  
+  facet_wrap(~f_firefreq) +
+  
+  scale_colour_viridis_d(option = "viridis") +
+  
+  theme(
+    legend.text     = element_text(face = "italic", size = 8),
+    legend.key.size = unit(0.3, "cm")
+  )
+
+
+outpath <- file.path(OUTPUT_DIR, "model_mgcv_rough_bark_density_cfpredict_focalspp.png")
+ggsave(plot = gg_focalspp, filename = outpath, width = 2400, height = 1800, units = "px")
+
+print(gg_focalspp)
+
+```
+
+
+

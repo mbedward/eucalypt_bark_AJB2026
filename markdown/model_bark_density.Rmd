@@ -1,6 +1,6 @@
 ---
 title: "Model bark density"
-author: "Eli and Michael"
+author: "Harriet, Eli and Michael"
 date: "2026-06-15"
 output: html_document
 ---
@@ -76,8 +76,6 @@ Each model includes two random effect terms:
 
 
 ## Data
-
-See `01_data.Rmd` for code used to prepare the data for the model.
 
 The data are stored as two non-spatial layers in the project geopackage. 
 
